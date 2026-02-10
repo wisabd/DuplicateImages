@@ -1,0 +1,2 @@
+# DuplicateImages
+p-Hash, mongoDB
