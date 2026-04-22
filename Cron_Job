@@ -1,0 +1,463 @@
+"""
+Image Duplicate Detector - Cron Job Script
+Runs on a fixed schedule, scans directories, detects duplicates, exports CSVs.
+"""
+
+import os
+import csv
+import json
+import logging
+import argparse
+import concurrent.futures
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+from logging.handlers import RotatingFileHandler
+
+from PIL import Image, ExifTags
+import imagehash
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+def setup_logging(log_dir: str = "logs") -> logging.Logger:
+    os.makedirs(log_dir, exist_ok=True)
+    logger = logging.getLogger("duplicate_detector")
+    logger.setLevel(logging.INFO)
+
+    handlers = [
+        RotatingFileHandler(
+            os.path.join(log_dir, "detector.log"),
+            maxBytes=10 * 1024 * 1024,   # 10 MB
+            backupCount=5
+        ),
+        logging.StreamHandler()
+    ]
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    for h in handlers:
+        h.setFormatter(fmt)
+        logger.addHandler(h)
+
+    return logger
+
+
+logger = setup_logging()
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def load_config(config_path: str = "config.json") -> dict:
+    """
+    Load configuration from a JSON file.
+    Falls back to defaults if file not found.
+    """
+    defaults = {
+        "base_directory": "/path/to/images",
+        "output_directory": "reports",
+        "dates": [],               # e.g. ["2025-10-13", "2025-10-14"]
+        "school_codes": [],        # e.g. ["31110073", "31110084"]
+        "classes": [
+            "ECE", "Nursery",
+            "Class 1", "Class 2", "Class 3",
+            "Class 4", "Class 5"
+        ],
+        "max_workers": 4,
+        "image_extensions": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"]
+    }
+
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            loaded = json.load(f)
+        defaults.update(loaded)
+        logger.info(f"Config loaded from {config_path}")
+    else:
+        logger.warning(f"Config file '{config_path}' not found — using defaults")
+
+    return defaults
+
+
+# ── Image Helpers ─────────────────────────────────────────────────────────────
+
+def get_capture_time(img: Image.Image) -> str:
+    try:
+        exif = {
+            ExifTags.TAGS[k]: v
+            for k, v in img._getexif().items()
+            if k in ExifTags.TAGS
+        }
+        return exif.get("DateTimeOriginal", "Unknown")
+    except Exception:
+        return "Unknown"
+
+
+def hash_image(file_path: str) -> dict | None:
+    """
+    Compute a rotation-invariant perceptual hash for an image.
+    Returns a dict with file metadata, or None on failure.
+    """
+    try:
+        if not os.path.exists(file_path):
+            logger.warning(f"File not found: {file_path}")
+            return None
+        if not os.access(file_path, os.R_OK):
+            logger.warning(f"Permission denied: {file_path}")
+            return None
+
+        img = Image.open(file_path)
+        file_size = os.path.getsize(file_path)
+        image_size = f"{img.size[0]} x {img.size[1]}"
+        capture_time = get_capture_time(img)
+
+        # Hash all 4 rotations, sort and join — makes duplicates rotation-invariant
+        hashes = []
+        for angle in [0, 90, 180, 270]:
+            rotated = img.rotate(angle, expand=True) if angle > 0 else img
+            hashes.append(str(imagehash.phash(rotated)))
+        combined_hash = "".join(sorted(hashes))
+
+        return {
+            "file_path":    file_path,
+            "hash_value":   combined_hash,
+            "file_size":    file_size,
+            "image_size":   image_size,
+            "capture_time": capture_time,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to hash {file_path}: {e}")
+        return None
+
+
+def get_image_files(directory: str, extensions: list[str]) -> list[str]:
+    """Recursively collect all image files under a directory."""
+    ext_set = {e.lower() for e in extensions}
+    found = []
+    path = Path(directory)
+
+    if not path.exists():
+        logger.warning(f"Directory does not exist: {directory}")
+        return found
+
+    try:
+        for f in path.rglob("*"):
+            if f.suffix.lower() in ext_set and f.is_file():
+                found.append(str(f))
+    except PermissionError as e:
+        logger.error(f"Permission error scanning {directory}: {e}")
+
+    return found
+
+
+# ── Core Processing ───────────────────────────────────────────────────────────
+
+def process_school_class(
+    base_directory: str,
+    school_code: str,
+    class_name: str,
+    dates: list[str],
+    max_workers: int,
+    extensions: list[str]
+) -> list[dict]:
+    """
+    Hash all images for a given school + class across all dates.
+    Returns a list of result dicts.
+    """
+    all_results = []
+
+    for date in dates:
+        dir_path = os.path.join(base_directory, school_code, "class_images", class_name, date)
+        image_files = get_image_files(dir_path, extensions)
+
+        if not image_files:
+            logger.info(f"  No images found: {school_code}/{class_name}/{date}")
+            continue
+
+        logger.info(f"  Hashing {len(image_files)} images: {school_code}/{class_name}/{date}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(hash_image, f): f for f in image_files}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    result.update({
+                        "date":        date,
+                        "class_name":  class_name,
+                        "school_code": school_code,
+                    })
+                    all_results.append(result)
+
+    return all_results
+
+
+def find_duplicates(results: list[dict]) -> dict:
+    """
+    Group results by school → class → hash.
+    Returns only groups with more than one image (duplicates).
+    """
+    # Build nested index: school → class → hash → [items]
+    index = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for r in results:
+        index[r["school_code"]][r["class_name"]][r["hash_value"]].append(r)
+
+    duplicates = {}
+
+    for school_code, class_groups in index.items():
+        for class_name, hash_groups in class_groups.items():
+            groups = []
+
+            for hash_value, items in hash_groups.items():
+                if len(items) < 2:
+                    continue
+
+                # Largest file first (keep it, delete the rest)
+                items_sorted = sorted(items, key=lambda x: x["file_size"], reverse=True)
+                wasted = sum(i["file_size"] for i in items_sorted[1:])
+                dates_in_group = sorted({i["date"] for i in items})
+
+                groups.append({
+                    "hash_value":      hash_value,
+                    "count":           len(items),
+                    "items":           items_sorted,
+                    "wasted_bytes":    wasted,
+                    "wasted_mb":       wasted / (1024 * 1024),
+                    "wasted_gb":       wasted / (1024 * 1024 * 1024),
+                    "dates":           dates_in_group,
+                    "is_cross_date":   len(dates_in_group) > 1,
+                })
+
+            if groups:
+                key = f"{school_code}|{class_name}"
+                duplicates[key] = {
+                    "school_code":        school_code,
+                    "class_name":         class_name,
+                    "duplicate_groups":   groups,
+                    "total_duplicates":   sum(g["count"] - 1 for g in groups),
+                    "total_wasted_mb":    sum(g["wasted_mb"] for g in groups),
+                    "total_wasted_gb":    sum(g["wasted_gb"] for g in groups),
+                }
+
+    return duplicates
+
+
+# ── CSV Export ────────────────────────────────────────────────────────────────
+
+def export_summary_csv(duplicates: dict, output_path: str):
+    """
+    One row per duplicate group: school, class, count, dates involved.
+    """
+    rows = []
+    for entry in duplicates.values():
+        for group in entry["duplicate_groups"]:
+            rows.append({
+                "school_code":     entry["school_code"],
+                "class_name":      entry["class_name"],
+                "duplicate_count": group["count"],
+                "duplicate_dates": ", ".join(group["dates"]),
+                "wasted_space_mb": f"{group['wasted_mb']:.2f}",
+                "is_cross_date":   "Yes" if group["is_cross_date"] else "No",
+            })
+
+    rows.sort(key=lambda r: (r["school_code"], r["class_name"], -r["duplicate_count"]))
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "school_code", "class_name", "duplicate_count",
+            "duplicate_dates", "wasted_space_mb", "is_cross_date"
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        if rows:
+            writer.writerows(rows)
+        else:
+            writer.writerow({
+                "school_code": "No duplicates found",
+                "class_name": "", "duplicate_count": "",
+                "duplicate_dates": "", "wasted_space_mb": "", "is_cross_date": ""
+            })
+
+    logger.info(f"Summary CSV saved: {output_path}  ({len(rows)} rows)")
+
+
+def export_detailed_csv(duplicates: dict, output_path: str):
+    """
+    One row per duplicate file with full metadata and recommended action.
+    """
+    rows = []
+    for entry in duplicates.values():
+        for group in entry["duplicate_groups"]:
+            for idx, item in enumerate(group["items"]):
+                rows.append({
+                    "school_code":       entry["school_code"],
+                    "class_name":        entry["class_name"],
+                    "group_id":          group["hash_value"][:10],
+                    "file_path":         item["file_path"],
+                    "date":              item["date"],
+                    "file_size_mb":      f"{item['file_size'] / (1024 * 1024):.2f}",
+                    "image_size":        item["image_size"],
+                    "capture_time":      item["capture_time"],
+                    "duplicate_count":   group["count"],
+                    "dates_in_group":    ", ".join(group["dates"]),
+                    "is_cross_date":     "Yes" if group["is_cross_date"] else "No",
+                    "wasted_in_group_mb": f"{group['wasted_mb']:.2f}",
+                    "action":            "KEEP" if idx == 0 else "DELETE",
+                })
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "school_code", "class_name", "group_id", "file_path", "date",
+            "file_size_mb", "image_size", "capture_time", "duplicate_count",
+            "dates_in_group", "is_cross_date", "wasted_in_group_mb", "action"
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info(f"Detailed CSV saved: {output_path}  ({len(rows)} rows)")
+
+
+def export_school_date_matrix_csv(duplicates: dict, output_path: str):
+    """
+    Matrix: rows = schools, columns = dates, values = duplicate count.
+    """
+    # Collect all dates
+    all_dates = sorted({
+        date
+        for entry in duplicates.values()
+        for group in entry["duplicate_groups"]
+        for date in group["dates"]
+    })
+
+    # school → date → count
+    matrix = defaultdict(lambda: defaultdict(int))
+    for entry in duplicates.values():
+        school = entry["school_code"]
+        for group in entry["duplicate_groups"]:
+            for date in group["dates"]:
+                matrix[school][date] += group["count"]
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = ["school_code"] + all_dates + ["total_duplicates", "dates_affected"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for school, date_counts in sorted(matrix.items()):
+            row = {"school_code": school}
+            total = 0
+            affected = 0
+            for date in all_dates:
+                count = date_counts.get(date, 0)
+                row[date] = count
+                total += count
+                if count > 0:
+                    affected += 1
+            row["total_duplicates"] = total
+            row["dates_affected"] = affected
+            writer.writerow(row)
+
+    logger.info(f"School-date matrix CSV saved: {output_path}")
+
+
+# ── Run Report ────────────────────────────────────────────────────────────────
+
+def print_run_summary(duplicates: dict, elapsed_seconds: float):
+    total_groups   = sum(len(e["duplicate_groups"]) for e in duplicates.values())
+    total_dupes    = sum(e["total_duplicates"]       for e in duplicates.values())
+    total_wasted   = sum(e["total_wasted_mb"]        for e in duplicates.values())
+    schools        = {e["school_code"] for e in duplicates.values()}
+
+    logger.info("=" * 60)
+    logger.info("RUN SUMMARY")
+    logger.info(f"  Schools with duplicates : {len(schools)}")
+    logger.info(f"  Duplicate groups found  : {total_groups}")
+    logger.info(f"  Total duplicate files   : {total_dupes}")
+    logger.info(f"  Total wasted space      : {total_wasted:.2f} MB  ({total_wasted/1024:.3f} GB)")
+    logger.info(f"  Elapsed time            : {elapsed_seconds:.1f}s")
+    logger.info("=" * 60)
+
+
+# ── Main Entry Point ──────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Image Duplicate Detector (Cron Job)")
+    parser.add_argument("--config",  default="config.json",  help="Path to config JSON file")
+    parser.add_argument("--dry-run", action="store_true",    help="Scan only, skip CSV export")
+    args = parser.parse_args()
+
+    start_time = datetime.now()
+    logger.info(f"{'='*60}")
+    logger.info(f"Duplicate detection started at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"{'='*60}")
+
+    # Load config
+    config = load_config(args.config)
+
+    base_dir    = config["base_directory"]
+    output_dir  = config["output_directory"]
+    dates       = config["dates"]
+    schools     = config["school_codes"]
+    classes     = config["classes"]
+    max_workers = config["max_workers"]
+    extensions  = config["image_extensions"]
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Validate
+    if not schools:
+        logger.error("No school_codes defined in config. Exiting.")
+        return
+    if not dates:
+        logger.error("No dates defined in config. Exiting.")
+        return
+
+    # Process all schools and classes
+    all_results = []
+    total = len(schools) * len(classes)
+    done = 0
+
+    for school_code in schools:
+        for class_name in classes:
+            done += 1
+            logger.info(f"[{done}/{total}] Processing {school_code} / {class_name}")
+            results = process_school_class(
+                base_dir, school_code, class_name,
+                dates, max_workers, extensions
+            )
+            all_results.extend(results)
+
+    logger.info(f"Total images hashed: {len(all_results)}")
+
+    # Find duplicates
+    logger.info("Finding duplicates...")
+    duplicates = find_duplicates(all_results)
+
+    if not duplicates:
+        logger.info("No duplicates found. Exiting cleanly.")
+        return
+
+    if args.dry_run:
+        logger.info("Dry run — skipping CSV export.")
+        print_run_summary(duplicates, (datetime.now() - start_time).total_seconds())
+        return
+
+    # Export CSVs
+    timestamp = start_time.strftime("%Y%m%d_%H%M%S")
+
+    export_summary_csv(
+        duplicates,
+        os.path.join(output_dir, f"summary_{timestamp}.csv")
+    )
+    export_detailed_csv(
+        duplicates,
+        os.path.join(output_dir, f"detailed_{timestamp}.csv")
+    )
+    export_school_date_matrix_csv(
+        duplicates,
+        os.path.join(output_dir, f"school_date_matrix_{timestamp}.csv")
+    )
+
+    elapsed = (datetime.now() - start_time).total_seconds()
+    print_run_summary(duplicates, elapsed)
+    logger.info("Done.")
+
+
+if __name__ == "__main__":
+    main()
